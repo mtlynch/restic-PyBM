@@ -18,6 +18,8 @@ import json
 from datetime import datetime, timedelta
 from argparse import ArgumentParser
 
+import restic
+
 # ---- constants --------------------------------------------------------------
 
 APPDESC = 'A restic wrapper and Nagios-compliant status checker using a YAML configuration file.  Version 0.2.'
@@ -91,18 +93,11 @@ def parse_config(configFile):
     print("CRITICAL - Configuration file %s does not exist" % configFile)
     exit(2)
 
-
-# ---- run a command and return its output
-def run_command(command, commandEnv):
-  result = subprocess.run(command, env=commandEnv,
-                          shell=True, text=True, capture_output=True)
-  return result
-
 # ---- obtain a repository password -------------------------------------------
 def get_repo_password(repos, currentRepo, vault = False):
   if vault:
     vaultRead = vault.secrets.kv.v2.read_secret_version(
-      path=repos[currentRepo]['key']['path'], 
+      path=repos[currentRepo]['key']['path'],
       mount_point=repos[currentRepo]['key']['mountpoint']
     )
     if repos[currentRepo]['location'][0:3] == 'b2:':
@@ -150,15 +145,12 @@ if not args.repo in repos.keys() and not args.repo == 'ALL_REPOS':
   print("Repository %s absent from %s" % (args.repo, args.configFile))
   exit(2)
 
-# Prepare an ephemeral environment dictionnary for the restic invocation
-commandEnv = os.environ.copy()
-
 # If requested, self update restic first
 if args.selfUpdate:
-    command = resticLocation + ' self-update'
-    result = run_command(command, commandEnv)
-    if not result.returncode == 0:
-        print("CRITICAL - restic self-update failed: %s." % result.stderr)
+    try:
+        restic.self_update()
+    except restic.Error as e:
+        print("CRITICAL - restic self-update failed: %s." % str(e))
         exit(2)
 
 # Build a list with the repos to process
@@ -190,14 +182,14 @@ for currentRepo in reposToProcess:
 
   # Get the repository credentials
   if args.vault: repoCredentials = get_repo_password(repos, currentRepo, vault)
-  else: repoCredentials = get_repo_password(repos, currentRepo)  
-  
+  else: repoCredentials = get_repo_password(repos, currentRepo)
+
   if repos[currentRepo]['location'][0:3] == 'b2:':
-    commandEnv["B2_ACCOUNT_ID"] = repoCredentials['keyID']
-    commandEnv["B2_ACCOUNT_KEY"] = repoCredentials['applicationKey']
-    commandEnv["RESTIC_PASSWORD"] = repoCredentials['password']
+    os.environ.set('B2_ACCOUNT_ID', repoCredentials['keyID'])
+    os.environ.set('B2_ACCOUNT_KEY', repoCredentials['applicationKey'])
+    os.environ.set('RESTIC_PASSWORD', repoCredentials['password'])
   else:
-    commandEnv["RESTIC_PASSWORD"] = repoCredentials
+    os.environ.set('RESTIC_PASSWORD', repoCredentials)
 
   # If this a duplicate type repo, also get the source repository key
   if 'duplicate' in repos[currentRepo].keys():
@@ -205,63 +197,59 @@ for currentRepo in reposToProcess:
 
     if args.vault: repoCredentials2 = get_repo_password(repos, duplicateSource, vault)
     else: repoCredentials2 = get_repo_password(repos, duplicateSource)
-    commandEnv["RESTIC_PASSWORD2"] = repoCredentials2
+    os.environ.set('RESTIC_PASSWORD2', repoCredentials2)
 
     # When duplicating we need to invert the password variables 1 and 2
     if args.action == 'run':
-      buffer = commandEnv["RESTIC_PASSWORD2"]
-      commandEnv["RESTIC_PASSWORD2"] = commandEnv["RESTIC_PASSWORD"]
-      commandEnv["RESTIC_PASSWORD"] = buffer
+      os.environ['RESTIC_PASSWORD2'], os.environ['RESTIC_PASSWORD'] = (
+          os.environ['RESTIC_PASSWORD'], os.environ['RESTIC_PASSWORD2']
+      )
 
 
-  
+
   # ---- actions execution ----------------------------------------------------
 
+  restic.binary_path = resticLocation
+  restic.repository = repos[currentRepo]['location']
   if args.action == 'create':
-      # Create a new restic repo with the infos provided in backup.yml
-      command = resticLocation + ' init --repo ' + repos[currentRepo]['location']
-      # If this is a repo that will hold duplicates  amend the restic command
+      repo2 = None
+      copyChunkerParams = False
+      # If this is a repo that will hold duplicates, set the proper parameters
       if 'duplicate' in repos[currentRepo].keys():
-        command += ' --repo2 ' + repos[duplicateSource]['location'] + ' --copy-chunker-params'
+        repo2 = repos[duplicateSource]['location']
+        copyChunkerParams = True
 
-      result = run_command(command, commandEnv)
+      # Create a new restic repo with the infos provided in backup.yml
+      restic.init(repo2=repo2, copy_chunker_params=copyChunkerParams)
+
       # Return the results
       successMessage = ("Repository %s successfully created at location %s" % (currentRepo, repos[currentRepo]['location']))
       errorMessage = ("Error creating repository %s" % repos[currentRepo]['location'])
 
   if args.action == 'prune':
       # Clean up repo according to provided preservation policy
-      command = resticLocation + ' forget --group-by host --keep-within ' + \
-          repos[currentRepo]['max_age'] + 'd --prune --repo ' + \
-          repos[currentRepo]['location']
-      result = run_command(command, commandEnv)
+      restic.forget(group_by='host',
+                    keep_within=repos[currentRepo]['max_age'] + 'd',
+                    prune=True)
       # Return the results
       successMessage = ("Repository %s clean up successful" % currentRepo)
       errorMessage = ("Error cleaning up repository %s" % currentRepo)
 
   elif args.action == 'check':
-      # Check the repository integrity
-      command = resticLocation + ' check --repo ' + repos[currentRepo]['location']
+      readData = False
+
       if args.full:
-          command = command + ' --read-data'
-      result = run_command(command, commandEnv)
-      # Check the restic return code
+          readData= True
       errorMessage = ''
-      if not result.returncode == 0:
+      # Check the repository integrity
+      if not restic.check(read_data=readData):
           errorMessage = ("Error checking repository %s" % currentRepo)
       else:
           # If requested, check the snapshots age
           if args.age:
-              command = resticLocation + ' snapshots --json --group-by host --repo ' + \
-                  repos[currentRepo]['location']
-              result2 = run_command(command, commandEnv)
-              if not result2.returncode == 0:
-                  errorMessage = (
-                      "Error getting snapshots for repository %s" % currentRepo)
-                  result.stderr = result.stderr + "\n" + result2.stderr
-                  result.returncode = 2
-              else:
-                  snaps = json.loads(result2.stdout)
+              try:
+                  snaps = restic.snapshots(group_by='host')
+
                   # Oldest snapshot is the first one
                   oldestTime = snaps[0]['snapshots'][0]['time']
                   # Newest snapshot is the last one
@@ -286,15 +274,17 @@ for currentRepo in reposToProcess:
                       result.stdout = result.stdout + "\n" + \
                           ("Newest snapshot age: %s" % newDiff) + \
                           "\n" + ("Oldest snapshot age: %s" % oldDiff)
+              except restic.errors.Error as e:
+                  errorMessage = (
+                      "Error getting snapshots for repository %s" % currentRepo)
+
       # Return the results
       successMessage = ("Repository %s is healthy" % currentRepo)
       # errorMessage is already defined
 
   elif args.action == 'list':
       # List snapshots in the repo
-      command = resticLocation + ' snapshots --group-by host --repo ' + \
-          repos[currentRepo]['location']
-      result = run_command(command, commandEnv)
+      restic.snapshots(group_by='host')
       # Return the results
       successMessage = ("Snapshot list retreived for repository %s" % currentRepo)
       errorMessage = ("Error listing snapshots on repository %s" % repos[currentRepo]['location'])
@@ -302,41 +292,31 @@ for currentRepo in reposToProcess:
   else:
       # If this is a duplicate type repo, we copy snapshots from the source to the destination
       if 'duplicate' in repos[currentRepo].keys():
-        command = resticLocation + ' copy --repo2 ' + repos[currentRepo]['location'] + ' --repo ' + repos[duplicateSource]['location']
-        result = run_command(command, commandEnv)
+        restic.repository = repos[duplicateSource]['location'])
+        restic.copy(repo2=repos[currentRepo]['location'])
+
         # Swap the repositories password to enable the unlock
-        commandEnv["RESTIC_PASSWORD"] = commandEnv["RESTIC_PASSWORD2"]
+        os.environ.set('RESTIC_PASSWORD', os.environ.get('RESTIC_PASSWORD2'))
 
       # For a standard repo, create a new snapshot
       else:
-        command = resticLocation + ' backup --exclude \'lost+found\' --repo ' + repos[currentRepo]['location']
-        # Incorporate includes (mandatory)
-        for folder in repos[currentRepo]['includes']:
-          command = command + ' ' + folder
+        excludes = ['lost+found']
         # Incorporate excludes if present
-        if 'excludes' in repos[currentRepo].keys():
-          for folder in repos[currentRepo]['excludes']:
-            command = command + ' --exclude="' + folder + '"'
-        result = run_command(command, commandEnv)        
-      
+        if 'excludes' in repos[currentRepo]:
+          excludes += repos[currentRepo]['excludes']
+        restic.backup(paths=repos[currentRepo]['includes'], exclude_patterns=excludes)
+
       # Return the results
       successMessage = ("Snapshot successfully created on repository %s" % currentRepo)
       errorMessage = ("Error creating new snapshot on repository %s" % repos[currentRepo]['location'])
 
-  # At the end of each loop round, we accumulate the outputs to prepare the final script output
-  if not result.returncode == 0:
-    scriptReturnValue = 2
   successMessageAccumulated += successMessage + ". "
   errorMessageAccumulated += errorMessage + ". "
-  stdoutAccumulated += result.stdout
-  stderrAccumulated += result.stderr
 
   # Ensure the repository is unlocked
-  command = resticLocation + ' unlock --repo ' + repos[currentRepo]['location']
-  resultUnlock = run_command(command, commandEnv)
-  stdoutAccumulated += resultUnlock.stdout
-  stderrAccumulated += resultUnlock.stderr
-  if scriptReturnValue < 2 and not resultUnlock.returncode == 0:
+  try:
+    restic.unlock()
+  except restic.errors.Error:
     scriptReturnValue = 1
 
 # Provide the user output
